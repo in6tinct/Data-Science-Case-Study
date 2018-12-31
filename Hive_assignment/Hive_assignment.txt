@@ -1,0 +1,289 @@
+/* First the DDLS */
+
+/* IMPORTANT: BEFORE CREATING ANY TABLE, MAKE SURE YOU RUN THIS COMMAND */
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+/* Check the file #~ hdfs dfs -cat /common_folder/nyc_taxi_data/yellow_tripdata_2017-11.csv | head 
+VendorID,tpep_pickup_datetime,tpep_dropoff_datetime,passenger_count,trip_distance,RatecodeID,store_and_fwd_flag,PULocationID,DOLocationID,payment_type,fare_amount,
+extra,mta_tax,tip_amount,tolls_amount,improvement_surcharge,total_amount
+1,2017-11-01 00:01:48,2017-11-01 00:03:47,1,.40,1,N,151,151,2,3.5,0.5,0.5,0,0,0.3,4.8
+1,2017-11-01 00:18:22,2017-11-01 00:40:32,1,4.80,1,N,142,144,1,17.5,0.5,0.5,2,0,0.3,20.8
+1,2017-11-01 00:01:58,2017-11-01 00:15:57,1,3.70,1,N,151,140,1,14,0.5,0.5,3.05,0,0.3,18.35
+*/
+--First two lines are headers
+
+/* PARTITION THE DATA  */
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+--ALTER TABLE stg_tlc_data SET TBLPROPERTIES('EXTERNAL'='False');
+--drop table stg_tlc_data;
+
+/* Loading stagin table */
+create external 
+table if not exists stg_tlc_data
+(VendorID int, tpep_pickup_datetime string, tpep_dropoff_datetime string, Passenger_count int, Trip_distance double,
+RatecodeID int,store_and_fwd_flag string,PULocationID int,DOLocationID int,payment_type int,fare_amount double,
+extra double,mta_tax double,tip_amount double,tolls_amount double,improvement_surcharge double,total_amount double
+) row FORMAT DELIMITED
+fields TERMINATED BY ','
+lines TERMINATED BY '\n'
+LOCATION
+'/common_folder/nyc_taxi_data/'
+; --count is 18793083 : Matches
+
+/* ########## DATA QUALITY ISSUES : Stage ############## */
+
+select distinct vendorid from stg_tlc_data; --Nulls present due to headers and blank lines
+
+SELECT vendorid,count(*) as count from stg_tlc_data WHERE vendorid is NOT NULL GROUP BY vendorid;
+/*
+ 	vendorid	count
+1	1			8447149
+2	2			10345930
+*/
+
+select distinct
+year(from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd hh:mm:ss'))),
+year(from_unixtime(unix_timestamp(tpep_dropoff_datetime,'yyyy-MM-dd hh:mm:ss')))
+ from stg_tlc_data;
+/*
+vendorid	pickup	dropoff
+1	NULL	NULL	NULL
+2	2	2008	2008
+3	1	2017	2016 --back to the future?
+4	2	2001	2001
+5	2	2008	2009
+6	1	2017	2017
+7	1	2017	2018
+8	1	2017	2019
+9	2	2041	2041 --back to the future part 2?
+10	2	2009	2009
+11	2	2017	2017
+12	2	2017	2018
+13	2	2003	2003
+14	2	2018	2018
+
+*/
+
+--Lets partition the data and load into a partitioned table
+
+create external 
+table if not exists temp_tlc_data
+(vendorid int, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp, Passenger_count int, Trip_distance double,
+RatecodeID int,store_and_fwd_flag string,PULocationID int,DOLocationID int,payment_type int,fare_amount double,
+extra double,mta_tax double,tip_amount double,tolls_amount double,improvement_surcharge double,total_amount double
+) partitioned by (yr int, mnth int)
+stored as orc location '/user/sarthakdey_outlook/temp_tlc_data'
+tblproperties ("orc.compress"="SNAPPY");
+
+insert overwrite table temp_tlc_data partition(yr , mnth)
+select VendorID, from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd HH:mm:ss')) as tpep_pickup_datetime, 
+from_unixtime(unix_timestamp(tpep_dropoff_datetime,'yyyy-MM-dd HH:mm:ss')) as tpep_dropoff_datetime, Passenger_count, Trip_distance ,RatecodeID,store_and_fwd_flag,PULocationID,DOLocationID,payment_type,fare_amount ,
+extra ,mta_tax ,tip_amount ,tolls_amount ,improvement_surcharge ,total_amount ,
+year(from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd HH:mm:ss'))) as yr, month(from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd HH:mm:ss'))) as mnth
+from stg_tlc_data where vendorid is not null and 
+year(from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd HH:mm:ss'))) = 2017 and
+month(from_unixtime(unix_timestamp(tpep_pickup_datetime,'yyyy-MM-dd HH:mm:ss'))) in (11,12)
+; 
+
+--Time to check for data quality issues in 2017 - Nov and Dec data
+
+select vendorid,count(*) from temp_tlc_data where passenger_count>6 group by vendorid;
+/*
+1	9
+2	183 --vendorid 2 has over 6 passengers: Allowed limit is 5+1 kid on a lap
+*/
+
+--Lets check the pickup and dropoff errors
+select vendorid,count(*) from temp_tlc_data where tpep_pickup_datetime > tpep_dropoff_datetime
+group by vendorid;
+--vendor id 1 has 1419 rows with pickup after dropoff
+
+select vendorid,count(*) from temp_tlc_data where tpep_pickup_datetime = tpep_dropoff_datetime
+and trip_distance>0
+group by vendorid;
+
+/* 
+1	2
+2	538 -- vendor id 2 has 538 rows where trip was done but pickup and drop is incorrect
+ */
+select vendorid,count(*) from temp_tlc_data where passenger_count=0 group by vendorid;
+/*
+1	108750 --vendor id 1 is doing a poor job at passenger count enlistment
+2	220
+*/
+
+select vendorid,ratecodeid,count(*) from temp_tlc_data
+where ratecodeid not between 1 and 6
+group by vendorid,ratecodeid;
+/*
+2	99	6
+2	99	172
+*/
+
+--Lets check the speed : 100mph is the limit
+select vendorid,count(*) from temp_tlc_data
+where (trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))>100
+and tpep_dropoff_datetime>tpep_pickup_datetime and trip_distance>0
+group by vendorid
+;
+/*
+1	14011 --vendorid 1 has a lot of unrealistic speeds
+2	2088
+*/
+
+select vendorid,count(*) from temp_tlc_data where total_amount<0 or fare_amount<0 or tolls_amount<0
+group by vendorid;
+--2 vendorid has issues with amounts: 9372 rows
+
+SELECT vendorid,count(*) from temp_tlc_data WHERE payment_type=2 and tip_amount!=0 GROUP BY vendorid;
+--Cash tips are in the data for vendorid 1 : 3 rows : Need to be changed to zero
+
+--VendorID 1 is doing a bad job.
+
+/* Need to filter the data based on the following:
+passenger count <=6 and >0, drop > pickup, ratecodeid!=99,
+(trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))<=100,
+total_amount,fare_amount,tolls_amount>=0,tpep_dropoff_datetime>tpep_pickup_datetime,trip_distance>0,
+tip will be 0 for cash transactions
+ */
+---------------------------------------------------------
+---------------------------------------------------------
+--Time to filter out the incorrect data --
+
+create external 
+table if not exists tlc_data
+(VendorID int, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp, Passenger_count int, Trip_distance double,
+RatecodeID int,store_and_fwd_flag string,PULocationID int,DOLocationID int,payment_type int,fare_amount double,
+extra double,mta_tax double,tip_amount double,tolls_amount double,improvement_surcharge double,total_amount double,day int--,speed double
+) partitioned by (yr int, mnth int)
+stored as orc location '/user/sarthakdey_outlook/tlc_data'
+tblproperties ("orc.compress"="SNAPPY");
+
+--Filter and load
+insert overwrite table tlc_data partition(yr , mnth)
+select VendorID,tpep_pickup_datetime,tpep_dropoff_datetime,Passenger_count,Trip_distance,
+RatecodeID,store_and_fwd_flag,PULocationID,DOLocationID,payment_type,fare_amount,
+extra,mta_tax,
+case when payment_type=2 then 0 else tip_amount end as tip_amount
+,tolls_amount,improvement_surcharge,total_amount,
+day(tpep_pickup_datetime) as day,
+--(trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime)) as speed,
+yr,mnth from temp_tlc_data
+where passenger_count <=6 and passenger_count>0 and ratecodeid!=99 and
+(trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))<=100 and
+tpep_dropoff_datetime>tpep_pickup_datetime and
+total_amount>=0 and fare_amount>=0 and tolls_amount>=0 and trip_distance>0
+; 
+
+/*Finally time for some analysis */
+
+--Compare the overall average fare per trip for November and December.
+SELECT mnth,avg(fare_amount) from tlc_data GROUP BY mnth;
+--Almost same fare amount ~13 for both nov and dec
+
+--Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? Do most people travel solo or with other people?
+/* 
+1	13137310 --Most people ride solo
+2	2798835
+3	806435
+4	396489
+5	871858
+6	529238
+*/
+
+--Which is the most preferred mode of payment?
+SELECT payment_type,count(*) from tlc_data GROUP BY payment_type;
+--1 : Credit card is the preferred mode of payment
+
+--Average tip : Including cash transactions because question did not say otherwise
+SELECT avg(tip_amount) from tlc_data; -- ~1.85
+
+--Percentile
+SELECT percentile_approx(tip_amount,0.25) as 25th
+,percentile_approx(tip_amount,0.5) as 50th
+,percentile_approx(tip_amount,0.75) as 75th
+from tlc_data
+/*
+25th	50th	75th
+0		1.36	2.45
+Average tip is not a clear representative as the 50th percentile is 1.36
+*/
+
+--extra levied
+SELECT count(*) from tlc_data; --18540165
+SELECT count(*)/18540165 from tlc_data where extra>=0
+--Fraction Levied: ~0.46
+
+
+/* ################ Analysis-II ############## */
+
+--1 ) Correlation between passenger count and tip amount
+SELECT corr(passenger_count,tip_amount) from tlc_data;
+-- (-0.004) Seems to no correlation almost
+
+--Solo vs multiple travellers
+SELECT avg(tip_amount) from tlc_data WHERE passenger_count=1
+UNION all
+SELECT avg(tip_amount) from tlc_data WHERE passenger_count>1;
+/* 
+1.852771328376108
+1.8253118619700632  --Average tip is almost the same
+ */
+
+--2) fraction share of tip buckets
+select count(*) from tlc_data; --18540165
+--fraction
+SELECT 
+case when tip_amount>=0 and tip_amount<5 then '0-5' 
+when tip_amount>=5 and tip_amount<10 then '5-10' 
+when tip_amount>=10 and tip_amount<15 then '10-15' 
+when tip_amount>=15 and tip_amount<20 then '15-25' 
+when tip_amount>=20 then '>=20'
+end as tip_amount,count(*)/18540165
+from tlc_data
+GROUP BY
+case when tip_amount>=0 and tip_amount<5 then '0-5' 
+when tip_amount>=5 and tip_amount<10 then '5-10' 
+when tip_amount>=10 and tip_amount<15 then '10-15' 
+when tip_amount>=15 and tip_amount<20 then '15-25' 
+when tip_amount>=20 then '>=20'
+end
+;
+/*
+ 	tip_amount	_c1
+1	5-10	0.05640516144273797
+2	15-25	0.0022594728795563577
+3	0-5		0.9221780388685861
+4	10-15	0.01825577064713286
+5	>=20	0.0009015561619866922
+*/
+
+--3) Average speed(mph) over the months: Already have speed inside the table
+select mnth,avg((trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))) 
+from tlc_data group by mnth;
+
+/*
+11	10.874411648828007 --Average speed is same
+2	10.95480246816907
+*/
+
+--4) Speed on happening days
+select mnth,day,avg(speed) from tlc_data where mnth=12 and day in (25,31) group by mnth,day;
+
+/* 
+12	25	14.98873871509996
+12	31	13.123677169112225 --Happening days have more speed
+ */
+
+--Overall : 
+SELECT avg((trip_distance*3600)/(unix_timestamp(tpep_dropoff_datetime)-unix_timestamp(tpep_pickup_datetime))) from tlc_data;
+ -- ~10.92mph
+
+
+
+
+
+
+
